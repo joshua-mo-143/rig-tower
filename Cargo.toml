@@ -1,0 +1,11 @@
+[package]
+name = "rig-tower"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rig-core = "0.9.1"
+schemars = "0.8.22"
+serde = { version = "1.0.218", features = ["derive"] }
+tokio = { version = "1.43.0", features = ["macros"] }
+tokio-test = "0.4.4"
