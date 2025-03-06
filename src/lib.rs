@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, sync::Arc};
 
 use rig::{
     agent::Agent,
@@ -6,13 +6,10 @@ use rig::{
     extractor::Extractor,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 trait Service {
-    type Input: Display;
-    type Output: Display;
-
-    async fn call(&mut self, input: Self::Input) -> Self::Output;
+    async fn call(&mut self, input: String) -> String;
 }
 
 trait Layer<S> {
@@ -48,23 +45,23 @@ impl<L> ServiceBuilder<L> {
     }
 }
 
-struct Stack<A, B> {
-    inner: A,
-    outer: B,
+struct Stack<Inner, Outer> {
+    inner: Inner,
+    outer: Outer,
 }
 
-impl<A, B> Stack<A, B> {
-    fn new(inner: A, outer: B) -> Self {
+impl<Inner, Outer> Stack<Inner, Outer> {
+    fn new(inner: Inner, outer: Outer) -> Self {
         Self { inner, outer }
     }
 }
 
-impl<S, A, B> Layer<S> for Stack<A, B>
+impl<S, Inner, Outer> Layer<S> for Stack<Inner, Outer>
 where
-    A: Layer<S>,
-    B: Layer<A::Service>,
+    Inner: Layer<S>,
+    Outer: Layer<Inner::Service>,
 {
-    type Service = B::Service;
+    type Service = Outer::Service;
 
     fn layer(&self, inner: S) -> Self::Service {
         // Here we stack middleware layers
@@ -82,17 +79,67 @@ impl<M, T> Service for ExtractService<M, T>
 where
     M: CompletionModel,
     T: Display + JsonSchema + for<'a> Deserialize<'a> + Send + Sync,
+    T: Serialize,
 {
-    type Input = String;
-    type Output = T;
+    async fn call(&mut self, input: String) -> String {
+        let res = self.extractor.extract(&input).await.unwrap();
 
-    async fn call(&mut self, input: Self::Input) -> Self::Output {
-        self.extractor.extract(&input).await.unwrap()
+        serde_json::to_string_pretty(&res).unwrap()
+    }
+}
+
+struct AgentLayerService<M: CompletionModel, S> {
+    inner: S,
+    agent: Arc<Agent<M>>,
+}
+
+impl<M: CompletionModel, S: Service> Service for AgentLayerService<M, S> {
+    async fn call(&mut self, input: String) -> String {
+        let res = self.inner.call(input).await;
+
+        let next = self.agent.prompt(res.as_ref()).await.unwrap();
+
+        next
+    }
+}
+
+struct AgentLayer<M: CompletionModel> {
+    agent: Arc<Agent<M>>,
+}
+
+impl<M: CompletionModel> AgentLayer<M> {
+    fn new(agent: Agent<M>) -> Self {
+        let agent = Arc::new(agent);
+
+        Self { agent }
+    }
+}
+
+impl<S: Service, M: CompletionModel> Layer<S> for AgentLayer<M> {
+    type Service = AgentLayerService<M, S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AgentLayerService {
+            inner,
+            agent: Arc::clone(&self.agent),
+        }
     }
 }
 
 struct AgentService<M: CompletionModel> {
     agent: Agent<M>,
+}
+
+impl<M: CompletionModel> AgentService<M> {
+    fn new(agent: Agent<M>) -> Self {
+        Self { agent }
+    }
+}
+
+impl<M: CompletionModel> From<Agent<M>> for AgentService<M> {
+    fn from(value: Agent<M>) -> Self {
+        Self::new(value)
+    }
 }
 
 struct LoggingMiddleware;
@@ -122,10 +169,7 @@ impl<S> Service for LoggingService<S>
 where
     S: Service,
 {
-    type Input = String;
-    type Output = String;
-
-    async fn call(&mut self, input: Self::Input) -> Self::Output {
+    async fn call(&mut self, input: String) -> String {
         println!("Before a message!");
         let res = self.inner.call(input).await;
         println!("LLM response: {res}");
@@ -135,10 +179,8 @@ where
 }
 
 impl<T: CompletionModel> Service for AgentService<T> {
-    type Input = String;
-    type Output = String;
-
-    async fn call(&mut self, input: Self::Input) -> Self::Output {
+    async fn call(&mut self, input: String) -> String {
+        let input = input.to_string();
         let res = self.agent.prompt(input).await.unwrap();
 
         res
@@ -149,7 +191,7 @@ impl<T: CompletionModel> Service for AgentService<T> {
 mod tests {
     use rig::providers::openai;
 
-    use crate::{AgentService, LoggingMiddleware, Service, ServiceBuilder};
+    use crate::{AgentLayer, AgentService, LoggingMiddleware, Service, ServiceBuilder};
 
     #[tokio::test]
     async fn macro_works() {
@@ -167,5 +209,29 @@ mod tests {
             .build(agent_service);
 
         thing.call("Hello world!".to_string()).await;
+    }
+
+    #[tokio::test]
+    async fn agent_layering_works() {
+        let openai_client = openai::Client::from_env();
+
+        let agent_one = openai_client
+            .agent("gpt-4o")
+            .preamble("You are a helpful assistant.")
+            .build();
+
+        let agent_two = openai_client
+            .agent("gpt-4o")
+            .preamble("Your job is to guess what the user prompt is in response to. Only give your guess.")
+            .build();
+
+        let agent_service = AgentService::new(agent_one);
+        let agent_layer = AgentLayer::new(agent_two);
+
+        let mut service = ServiceBuilder::new()
+            .layer(agent_layer)
+            .build(agent_service);
+
+        println!("{}", service.call("Hello world!".into()).await)
     }
 }

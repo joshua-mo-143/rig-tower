@@ -850,6 +850,7 @@ dependencies = [
  "rig-core",
  "schemars",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-test",
 ]
